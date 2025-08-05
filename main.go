@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/glamour"
 	"github.com/spf13/pflag"
 )
 
@@ -21,10 +23,27 @@ type GPSEntry struct {
 	TimeSec float64
 	Lat     float64
 	Lon     float64
+	Height  float64 // The height in the subtitle file is relative to the takeoff position
 }
 
 var ffmpegBase = "ffmpeg"
-var extraFfmpegArgs = []string{"-hide_banner", "-v", "error"}
+var extraFfmpegArgs = []string{"-hide_banner", "-v", "warning"}
+
+type FrameInfo struct {
+	Path    string
+	TimeSec float64
+}
+
+type Options = struct {
+	inputVideo   string
+	extractMode  string
+	tagMode      string
+	longHelp     bool
+	useHeight    bool
+	heightOffset float64
+}
+
+var options Options
 
 func timeStrToSeconds(timeStr string) (float64, error) {
 	parts := strings.Split(timeStr, ":")
@@ -74,6 +93,7 @@ func parseSRT(srtPath string) ([]GPSEntry, error) {
 
 	timeRe := regexp.MustCompile(`^(\d{2}:\d{2}:\d{2},\d{3})`)
 	gpsRe := regexp.MustCompile(`GPS\s*\(\s*([-0-9.]+)\s*,\s*([-0-9.]+)`)
+	heightRe := regexp.MustCompile(`H\s*([-\d.]+)m`)
 
 	entries := []GPSEntry{}
 	scanner := bufio.NewScanner(file)
@@ -93,6 +113,13 @@ func parseSRT(srtPath string) ([]GPSEntry, error) {
 			if err != nil {
 				continue
 			}
+			height := 0.0
+			if hMatch := heightRe.FindStringSubmatch(line); hMatch != nil {
+				h, err := strconv.ParseFloat(hMatch[1], 64)
+				if err == nil {
+					height = h
+				}
+			}
 			timeSec, err := timeStrToSeconds(currentTime)
 			if err != nil {
 				continue
@@ -102,6 +129,7 @@ func parseSRT(srtPath string) ([]GPSEntry, error) {
 				TimeSec: timeSec,
 				Lat:     lat,
 				Lon:     lon,
+				Height:  height,
 			})
 			currentTime = ""
 		}
@@ -143,11 +171,7 @@ func getAvgFPS(videoPath string) (float64, error) {
 	return num / den, nil
 }
 
-func sanitizeFilename(timeStr string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(timeStr, ":", "_"), ",", "_")
-}
-
-func tagImage(imagePath string, lat, lon float64) error {
+func tagImage(imagePath string, lat, lon, height float64) error {
 	latAbs := math.Abs(lat)
 	lonAbs := math.Abs(lon)
 
@@ -160,19 +184,51 @@ func tagImage(imagePath string, lat, lon float64) error {
 		lonRef = "W"
 	}
 
-	cmd := exec.Command("exiftool",
+	// Base arguments for latitude/longitude
+	args := []string{
 		"-overwrite_original",
 		fmt.Sprintf("-GPSLatitude=%.9f", latAbs),
 		fmt.Sprintf("-GPSLatitudeRef=%s", latRef),
 		fmt.Sprintf("-GPSLongitude=%.9f", lonAbs),
 		fmt.Sprintf("-GPSLongitudeRef=%s", lonRef),
-		imagePath,
-	)
+	}
+
+	// Add height tags if enabled
+	if options.useHeight {
+		adjustedHeight := height + options.heightOffset
+		absAlt := math.Abs(adjustedHeight)
+		altRef := "0" // Above sea level
+		if adjustedHeight < 0 {
+			altRef = "1" // Below sea level
+		}
+		args = append(args,
+			fmt.Sprintf("-GPSAltitude=%.3f", absAlt),
+			fmt.Sprintf("-GPSAltitudeRef=%s", altRef),
+		)
+	}
+
+	args = append(args, imagePath)
+	cmd := exec.Command("exiftool", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
+func findClosestFrame(frames []FrameInfo, target float64) (FrameInfo, error) {
+	closest := frames[0]
+	minDiff := math.Abs(frames[0].TimeSec - target)
+
+	for _, frame := range frames[1:] {
+		diff := math.Abs(frame.TimeSec - target)
+		if diff < minDiff {
+			minDiff = diff
+			closest = frame
+		}
+	}
+	return closest, nil
+}
+
+// Helper function to find closest GPS entry
 func findClosestGPS(entries []GPSEntry, target float64) (GPSEntry, error) {
 	closest := entries[0]
 	minDiff := math.Abs(entries[0].TimeSec - target)
@@ -187,22 +243,22 @@ func findClosestGPS(entries []GPSEntry, target float64) (GPSEntry, error) {
 	return closest, nil
 }
 
-func interpolateGPS(entries []GPSEntry, target float64) (lat, lon float64, err error) {
+func interpolateGPS(entries []GPSEntry, target float64) (lat, lon, height float64, err error) {
 	if len(entries) == 0 {
-		return 0, 0, errors.New("no GPS entries")
+		return 0, 0, 0, errors.New("no GPS entries")
 	}
 	if target <= entries[0].TimeSec {
-		return entries[0].Lat, entries[0].Lon, nil
+		return entries[0].Lat, entries[0].Lon, entries[0].Height, nil
 	}
 	if target >= entries[len(entries)-1].TimeSec {
-		return entries[len(entries)-1].Lat, entries[len(entries)-1].Lon, nil
+		return entries[len(entries)-1].Lat, entries[len(entries)-1].Lon, entries[len(entries)-1].Height, nil
 	}
 
 	idx := sort.Search(len(entries), func(i int) bool {
 		return entries[i].TimeSec >= target
 	})
 	if idx == 0 || idx == len(entries) {
-		return entries[idx].Lat, entries[idx].Lon, nil
+		return entries[idx].Lat, entries[idx].Lon, entries[idx].Height, nil
 	}
 
 	prev := entries[idx-1]
@@ -214,15 +270,66 @@ func interpolateGPS(entries []GPSEntry, target float64) (lat, lon float64, err e
 
 	lat = prev.Lat*weightPrev + next.Lat*weightNext
 	lon = prev.Lon*weightPrev + next.Lon*weightNext
-	return lat, lon, nil
+	height = prev.Height*weightPrev + next.Height*weightNext
+	return lat, lon, height, nil
+}
+
+func extractFrames(videoPath, outDir, pattern string, args ...string) error {
+	cmdArgs := extraFfmpegArgs
+	cmdArgs = append(cmdArgs, "-y", "-i", videoPath)
+	cmdArgs = append(cmdArgs, args...)
+	cmdArgs = append(cmdArgs, filepath.Join(outDir, pattern))
+	cmd := exec.Command(ffmpegBase, cmdArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func getFrameTimes(outDir string, fps float64) ([]FrameInfo, error) {
+	files, err := filepath.Glob(filepath.Join(outDir, "frame_*.jpg"))
+	if err != nil {
+		return nil, err
+	}
+
+	frames := make([]FrameInfo, 0, len(files))
+	for _, file := range files {
+		base := filepath.Base(file)
+		frameNumStr := strings.TrimPrefix(strings.TrimSuffix(base, ".jpg"), "frame_")
+		frameNum, err := strconv.ParseInt(frameNumStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		frames = append(frames, FrameInfo{
+			Path:    file,
+			TimeSec: float64(frameNum) / fps,
+		})
+	}
+
+	// Sort by time
+	sort.Slice(frames, func(i, j int) bool {
+		return frames[i].TimeSec < frames[j].TimeSec
+	})
+
+	return frames, nil
 }
 
 func main() {
-	var inputVideo, extractMode, tagMode string
-	pflag.StringVarP(&inputVideo, "input", "i", "", "Input video file")
-	pflag.StringVar(&extractMode, "extract", "", "Extraction mode: fps=N, all, or direct")
-	pflag.StringVar(&tagMode, "tag", "", "Tagging mode: direct, all, allip, none")
+	pflag.StringVarP(&options.inputVideo, "input", "i", "", "Input video file")
+	pflag.StringVar(&options.extractMode, "extract", "", "Extraction mode: fps=N, all, or direct")
+	pflag.StringVar(&options.tagMode, "tag", "", "Tagging mode: direct, all, allip, none")
+	pflag.BoolVarP(&options.longHelp, "long-help", "H", false, "Display long help")
+	pflag.BoolVar(&options.useHeight, "use-height", false, "Enable height tagging in images")
+	pflag.Float64Var(&options.heightOffset, "height-offset", 0.0, "Height offset to apply (meters)")
 	pflag.Parse()
+
+	inputVideo := options.inputVideo
+	extractMode := options.extractMode
+	tagMode := options.tagMode
+
+	if options.longHelp {
+		generateLongHelp()
+		os.Exit(0)
+	}
 
 	if inputVideo == "" {
 		fmt.Println("Error: Input video file is required")
@@ -236,6 +343,14 @@ func main() {
 	if extractMode == "direct" && (tagMode != "direct" && tagMode != "none") {
 		fmt.Println("Error: When using --extract direct, --tag must be direct or none")
 		os.Exit(1)
+	}
+
+	deps := []string{"exiftool", "ffmpeg", "ffprobe"}
+	for _, dep := range deps {
+		if _, err := exec.LookPath(dep); err != nil && errors.Is(err, exec.ErrNotFound) {
+			fmt.Printf("Error: %s not found in path\n", dep)
+			os.Exit(1)
+		}
 	}
 
 	base := strings.TrimSuffix(inputVideo, filepath.Ext(inputVideo))
@@ -264,128 +379,52 @@ func main() {
 		return entries[i].TimeSec < entries[j].TimeSec
 	})
 
+	var frames []FrameInfo
+	var fps float64
+
 	switch {
 	case extractMode == "all":
 		fmt.Println("Extracting all frames...")
-		fps, err := getAvgFPS(inputVideo)
+		fps, err = getAvgFPS(inputVideo)
 		if err != nil {
 			fmt.Printf("Error getting FPS: %v\n", err)
 			os.Exit(1)
 		}
-		cmd := exec.Command(ffmpegBase, append(extraFfmpegArgs, "-y", "-i", inputVideo, "-vsync", "0", "-start_number", "0",
-			"-q:v", "2", filepath.Join(outDir, "frame_%08d.jpg"))...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := extractFrames(inputVideo, outDir, "frame_%08d.jpg", "-vsync", "0", "-start_number", "0", "-q:v", "2"); err != nil {
 			fmt.Printf("Error extracting frames: %v\n", err)
 			os.Exit(1)
 		}
-		if tagMode != "none" {
-			files, err := filepath.Glob(filepath.Join(outDir, "frame_*.jpg"))
-			if err != nil {
-				fmt.Printf("Error listing frames: %v\n", err)
-				os.Exit(1)
-			}
-			for _, file := range files {
-				base := filepath.Base(file)
-				frameNumStr := strings.TrimPrefix(strings.TrimSuffix(base, ".jpg"), "frame_")
-				frameNum, err := strconv.ParseInt(frameNumStr, 10, 64)
-				if err != nil {
-					fmt.Printf("Error parsing frame number: %v\n", err)
-					continue
-				}
-				timeSec := float64(frameNum) / fps
-				switch tagMode {
-				case "all":
-					gps, err := findClosestGPS(entries, timeSec)
-					if err != nil {
-						fmt.Printf("Error finding GPS for frame %s: %v\n", base, err)
-						continue
-					}
-					if err := tagImage(file, gps.Lat, gps.Lon); err != nil {
-						fmt.Printf("Error tagging %s: %v\n", base, err)
-					} else {
-						fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", base, gps.Lat, gps.Lon)
-					}
-				case "allip":
-					lat, lon, err := interpolateGPS(entries, timeSec)
-					if err != nil {
-						fmt.Printf("Error interpolating GPS for frame %s: %v\n", base, err)
-						continue
-					}
-					if err := tagImage(file, lat, lon); err != nil {
-						fmt.Printf("Error tagging %s: %v\n", base, err)
-					} else {
-						fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", base, lat, lon)
-					}
-				}
-			}
+		frames, err = getFrameTimes(outDir, fps)
+		if err != nil {
+			fmt.Printf("Error getting frame times: %v\n", err)
+			os.Exit(1)
 		}
 
 	case strings.HasPrefix(extractMode, "fps="):
 		fpsStr := strings.TrimPrefix(extractMode, "fps=")
-		fps, err := strconv.ParseFloat(fpsStr, 64)
+		fps, err = strconv.ParseFloat(fpsStr, 64)
 		if err != nil {
 			fmt.Printf("Invalid FPS value: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("Extracting at %.2f fps...\n", fps)
-		cmd := exec.Command(ffmpegBase, append(extraFfmpegArgs, "-y", "-i", inputVideo, "-r", fmt.Sprintf("%.2f", fps),
-			"-start_number", "0", "-q:v", "2", filepath.Join(outDir, "frame_%08d.jpg"))...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := extractFrames(inputVideo, outDir, "frame_%08d.jpg", "-r", fmt.Sprintf("%.2f", fps), "-start_number", "0", "-q:v", "2"); err != nil {
 			fmt.Printf("Error extracting frames: %v\n", err)
 			os.Exit(1)
 		}
-		if tagMode != "none" {
-			files, err := filepath.Glob(filepath.Join(outDir, "frame_*.jpg"))
-			if err != nil {
-				fmt.Printf("Error listing frames: %v\n", err)
-				os.Exit(1)
-			}
-			for _, file := range files {
-				base := filepath.Base(file)
-				frameNumStr := strings.TrimPrefix(strings.TrimSuffix(base, ".jpg"), "frame_")
-				frameNum, err := strconv.ParseInt(frameNumStr, 10, 64)
-				if err != nil {
-					fmt.Printf("Error parsing frame number: %v\n", err)
-					continue
-				}
-				timeSec := float64(frameNum) / fps
-				switch tagMode {
-				case "all":
-					gps, err := findClosestGPS(entries, timeSec)
-					if err != nil {
-						fmt.Printf("Error finding GPS for frame %s: %v\n", base, err)
-						continue
-					}
-					if err := tagImage(file, gps.Lat, gps.Lon); err != nil {
-						fmt.Printf("Error tagging %s: %v\n", base, err)
-					} else {
-						fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", base, gps.Lat, gps.Lon)
-					}
-				case "allip":
-					lat, lon, err := interpolateGPS(entries, timeSec)
-					if err != nil {
-						fmt.Printf("Error interpolating GPS for frame %s: %v\n", base, err)
-						continue
-					}
-					if err := tagImage(file, lat, lon); err != nil {
-						fmt.Printf("Error tagging %s: %v\n", base, err)
-					} else {
-						fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", base, lat, lon)
-					}
-				}
-			}
+		frames, err = getFrameTimes(outDir, fps)
+		if err != nil {
+			fmt.Printf("Error getting frame times: %v\n", err)
+			os.Exit(1)
 		}
 
 	case extractMode == "direct":
 		fmt.Println("Extracting GPS-linked frames...")
 		for _, entry := range entries {
 			timeFF := strings.Replace(entry.TimeStr, ",", ".", -1)
-			frameName := sanitizeFilename(entry.TimeStr) + ".jpg"
+			frameName := fmt.Sprintf("direct_%s.jpg", strings.ReplaceAll(strings.ReplaceAll(entry.TimeStr, ":", "_"), ",", "_"))
 			outPath := filepath.Join(outDir, frameName)
+
 			cmd := exec.Command(ffmpegBase, append(extraFfmpegArgs, "-y", "-ss", timeFF, "-i", inputVideo,
 				"-vframes", "1", "-q:v", "2", outPath)...)
 			cmd.Stdout = os.Stdout
@@ -394,13 +433,10 @@ func main() {
 				fmt.Printf("Error extracting frame at %s: %v\n", timeFF, err)
 				continue
 			}
-			if tagMode == "direct" {
-				if err := tagImage(outPath, entry.Lat, entry.Lon); err != nil {
-					fmt.Printf("Error tagging %s: %v\n", frameName, err)
-				} else {
-					fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", frameName, entry.Lat, entry.Lon)
-				}
-			}
+			frames = append(frames, FrameInfo{
+				Path:    outPath,
+				TimeSec: entry.TimeSec,
+			})
 		}
 
 	default:
@@ -408,5 +444,69 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Tagging logic
+	switch tagMode {
+	case "direct":
+		fmt.Println("Tagging direct frames...")
+		for _, entry := range entries {
+			closest, err := findClosestFrame(frames, entry.TimeSec)
+			if err != nil {
+				fmt.Printf("Error finding frame for time %.2f: %v\n", entry.TimeSec, err)
+				continue
+			}
+			if err := tagImage(closest.Path, entry.Lat, entry.Lon, entry.Height); err != nil {
+				fmt.Printf("Error tagging %s: %v\n", filepath.Base(closest.Path), err)
+			} else {
+				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(closest.Path), entry.Lat, entry.Lon)
+			}
+		}
+
+	case "all":
+		fmt.Println("Tagging all frames with closest GPS...")
+		for _, frame := range frames {
+			gps, err := findClosestGPS(entries, frame.TimeSec)
+			if err != nil {
+				fmt.Printf("Error finding GPS for frame %s: %v\n", filepath.Base(frame.Path), err)
+				continue
+			}
+			if err := tagImage(frame.Path, gps.Lat, gps.Lon, gps.Height); err != nil {
+				fmt.Printf("Error tagging %s: %v\n", filepath.Base(frame.Path), err)
+			} else {
+				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(frame.Path), gps.Lat, gps.Lon)
+			}
+		}
+
+	case "allip":
+		fmt.Println("Tagging all frames with interpolated GPS...")
+		for _, frame := range frames {
+			lat, lon, height, err := interpolateGPS(entries, frame.TimeSec)
+			if err != nil {
+				fmt.Printf("Error interpolating GPS for frame %s: %v\n", filepath.Base(frame.Path), err)
+				continue
+			}
+			if err := tagImage(frame.Path, lat, lon, height); err != nil {
+				fmt.Printf("Error tagging %s: %v\n", filepath.Base(frame.Path), err)
+			} else {
+				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(frame.Path), lat, lon)
+			}
+		}
+
+	case "none":
+		fmt.Println("Skipping tagging as requested")
+	}
+
 	fmt.Println("Operation completed successfully.")
+}
+
+//go:embed longhelp.md
+var longHelp string
+
+func generateLongHelp() {
+	out, err := glamour.Render(longHelp, "dark")
+	if err != nil {
+		fmt.Printf("Error rendering markdown: %v\n", err)
+		fmt.Println(longHelp)
+		return
+	}
+	fmt.Println(out)
 }
