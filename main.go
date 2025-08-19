@@ -348,7 +348,7 @@ func main() {
 	deps := []string{"exiftool", "ffmpeg", "ffprobe"}
 	for _, dep := range deps {
 		if _, err := exec.LookPath(dep); err != nil && errors.Is(err, exec.ErrNotFound) {
-			fmt.Printf("Error: %s not found in path\n", dep)
+			fmt.Printf("Error: dependency %s not found in path\n", dep)
 			os.Exit(1)
 		}
 	}
