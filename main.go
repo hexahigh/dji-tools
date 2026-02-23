@@ -243,6 +243,133 @@ func findClosestGPS(entries []GPSEntry, target float64) (GPSEntry, error) {
 	return closest, nil
 }
 
+const earthRadius = 6371e3 // meters
+
+// haversineDistance computes the great-circle distance between two GPS coordinates
+// using the haversine formula.
+func haversineDistance(lat1, lon1, lat2, lon2 float64) float64 {
+	lat1R := lat1 * math.Pi / 180
+	lon1R := lon1 * math.Pi / 180
+	lat2R := lat2 * math.Pi / 180
+	lon2R := lon2 * math.Pi / 180
+
+	dLat := lat2R - lat1R
+	dLon := lon2R - lon1R
+
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1R)*math.Cos(lat2R)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return earthRadius * 2 * math.Asin(math.Sqrt(a))
+}
+
+// gpsCalculateDistances returns the cumulative haversine distance for each GPS entry.
+// If useEle is true, height differences are incorporated into the distance.
+func gpsCalculateDistances(entries []GPSEntry, useEle bool) []float64 {
+	dists := make([]float64, len(entries))
+	for i := 1; i < len(entries); i++ {
+		d := haversineDistance(entries[i-1].Lat, entries[i-1].Lon, entries[i].Lat, entries[i].Lon)
+		if useEle {
+			dEle := entries[i].Height - entries[i-1].Height
+			d = math.Sqrt(d*d + dEle*dEle)
+		}
+		dists[i] = dists[i-1] + d
+	}
+	return dists
+}
+
+// gpsRemoveDuplicates removes GPS entries whose horizontal position is identical
+// to the previous entry (zero haversine distance)
+func gpsRemoveDuplicates(entries []GPSEntry) []GPSEntry {
+	if len(entries) <= 1 {
+		return entries
+	}
+	dists := gpsCalculateDistances(entries, false)
+	result := []GPSEntry{entries[0]}
+	for i := 1; i < len(entries); i++ {
+		if dists[i] > dists[i-1] {
+			result = append(result, entries[i])
+		}
+	}
+	return result
+}
+
+// computePCHIPSlopes computes tangent slopes for a PCHIP spline using the
+// Fritsch-Carlson algorithm, which guarantees monotonicity within each interval.
+func computePCHIPSlopes(x, y []float64) []float64 {
+	n := len(x)
+	slopes := make([]float64, n)
+	if n < 2 {
+		return slopes
+	}
+
+	delta := make([]float64, n-1)
+	for i := range delta {
+		delta[i] = (y[i+1] - y[i]) / (x[i+1] - x[i])
+	}
+
+	// One-sided endpoint slopes
+	slopes[0] = delta[0]
+	slopes[n-1] = delta[n-2]
+
+	// Interior slopes via weighted harmonic mean (Fritsch-Carlson)
+	for i := 1; i < n-1; i++ {
+		if delta[i-1]*delta[i] <= 0 {
+			slopes[i] = 0 // local extremum: preserve shape
+		} else {
+			h0 := x[i] - x[i-1]
+			h1 := x[i+1] - x[i]
+			w0 := 2*h1 + h0
+			w1 := h1 + 2*h0
+			slopes[i] = (w0 + w1) / (w0/delta[i-1] + w1/delta[i])
+		}
+	}
+
+	// Clamp slopes to enforce monotonicity (|alpha|^2 + |beta|^2 <= 9)
+	for i := 0; i < n-1; i++ {
+		if delta[i] == 0 {
+			slopes[i] = 0
+			slopes[i+1] = 0
+		} else {
+			alpha := slopes[i] / delta[i]
+			beta := slopes[i+1] / delta[i]
+			tau := math.Sqrt(alpha*alpha + beta*beta)
+			if tau > 3 {
+				t := 3.0 / tau
+				slopes[i] = t * alpha * delta[i]
+				slopes[i+1] = t * beta * delta[i]
+			}
+		}
+	}
+
+	return slopes
+}
+
+// pchipEval evaluates a PCHIP spline (defined by knots x, values y, slopes m) at xq.
+func pchipEval(x, y, m []float64, xq float64) float64 {
+	n := len(x)
+	if xq <= x[0] {
+		return y[0]
+	}
+	if xq >= x[n-1] {
+		return y[n-1]
+	}
+
+	i := sort.SearchFloat64s(x, xq) - 1
+
+	h := x[i+1] - x[i]
+	t := (xq - x[i]) / h
+
+	// Cubic Hermite basis polynomials
+	h00 := (1 + 2*t) * (1 - t) * (1 - t)
+	h10 := t * (1 - t) * (1 - t)
+	h01 := t * t * (3 - 2*t)
+	h11 := t * t * (t - 1)
+
+	return h00*y[i] + h10*h*m[i] + h01*y[i+1] + h11*h*m[i+1]
+}
+
+// interpolateGPS returns the interpolated GPS position at the given target time
+// using piecewise cubic Hermite splines (PCHIP) parameterized by cumulative
+// haversine distance
 func interpolateGPS(entries []GPSEntry, target float64) (lat, lon, height float64, err error) {
 	if len(entries) == 0 {
 		return 0, 0, 0, errors.New("no GPS entries")
@@ -251,27 +378,56 @@ func interpolateGPS(entries []GPSEntry, target float64) (lat, lon, height float6
 		return entries[0].Lat, entries[0].Lon, entries[0].Height, nil
 	}
 	if target >= entries[len(entries)-1].TimeSec {
-		return entries[len(entries)-1].Lat, entries[len(entries)-1].Lon, entries[len(entries)-1].Height, nil
+		e := entries[len(entries)-1]
+		return e.Lat, e.Lon, e.Height, nil
 	}
 
-	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].TimeSec >= target
-	})
-	if idx == 0 || idx == len(entries) {
-		return entries[idx].Lat, entries[idx].Lon, entries[idx].Height, nil
+	// Remove spatially duplicate points so cumulative distance is strictly increasing
+	deduped := gpsRemoveDuplicates(entries)
+	if len(deduped) == 1 {
+		return deduped[0].Lat, deduped[0].Lon, deduped[0].Height, nil
 	}
 
-	prev := entries[idx-1]
-	next := entries[idx]
+	n := len(deduped)
+	cumDist := gpsCalculateDistances(deduped, true)
 
-	total := next.TimeSec - prev.TimeSec
-	weightPrev := (next.TimeSec - target) / total
-	weightNext := (target - prev.TimeSec) / total
+	lats := make([]float64, n)
+	lons := make([]float64, n)
+	heights := make([]float64, n)
+	times := make([]float64, n)
+	for i, e := range deduped {
+		lats[i] = e.Lat
+		lons[i] = e.Lon
+		heights[i] = e.Height
+		times[i] = e.TimeSec
+	}
 
-	lat = prev.Lat*weightPrev + next.Lat*weightNext
-	lon = prev.Lon*weightPrev + next.Lon*weightNext
-	height = prev.Height*weightPrev + next.Height*weightNext
-	return lat, lon, height, nil
+	// Build PCHIP splines for lat, lon, height, and time — all as functions of cumulative distance
+	mLat := computePCHIPSlopes(cumDist, lats)
+	mLon := computePCHIPSlopes(cumDist, lons)
+	mHeight := computePCHIPSlopes(cumDist, heights)
+	mTime := computePCHIPSlopes(cumDist, times)
+
+	// Invert the time spline to find the cumulative distance d* at which time == target.
+	// Time is monotonically increasing with distance after duplicate removal, so bisection converges.
+	dLow, dHigh := cumDist[0], cumDist[n-1]
+	for range 64 {
+		dMid := (dLow + dHigh) / 2
+		if pchipEval(cumDist, times, mTime, dMid) < target {
+			dLow = dMid
+		} else {
+			dHigh = dMid
+		}
+		if dHigh-dLow < 1e-9 {
+			break
+		}
+	}
+	dTarget := (dLow + dHigh) / 2
+
+	return pchipEval(cumDist, lats, mLat, dTarget),
+		pchipEval(cumDist, lons, mLon, dTarget),
+		pchipEval(cumDist, heights, mHeight, dTarget),
+		nil
 }
 
 func extractFrames(videoPath, outDir, pattern string, args ...string) error {
