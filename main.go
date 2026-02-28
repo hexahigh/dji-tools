@@ -5,7 +5,12 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	"io"
 	"math"
+	"math/big"
+	"math/bits"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/spf13/pflag"
@@ -35,12 +41,17 @@ type FrameInfo struct {
 }
 
 type Options = struct {
-	inputVideo   string
-	extractMode  string
-	tagMode      string
-	longHelp     bool
-	useHeight    bool
-	heightOffset float64
+	inputVideo           string
+	outputDir            string
+	dhashSize            int
+	extractMode          string
+	tagMode              string
+	longHelp             bool
+	useHeight            bool
+	heightOffset         float64
+	dedup                bool
+	dedupDistance        float64
+	dedupCompareDistance int
 }
 
 var options Options
@@ -209,7 +220,7 @@ func tagImage(imagePath string, lat, lon, height float64) error {
 
 	args = append(args, imagePath)
 	cmd := exec.Command("exiftool", args...)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = io.Discard
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -441,16 +452,17 @@ func extractFrames(videoPath, outDir, pattern string, args ...string) error {
 	return cmd.Run()
 }
 
-func getFrameTimes(outDir string, fps float64) ([]FrameInfo, error) {
-	files, err := filepath.Glob(filepath.Join(outDir, "frame_*.jpg"))
+func getFrameTimes(outDir string, prefix string, fps float64) ([]FrameInfo, error) {
+	files, err := filepath.Glob(filepath.Join(outDir, prefix+"_frame_*.jpg"))
 	if err != nil {
 		return nil, err
 	}
 
+	frameStripPrefix := prefix + "_frame_"
 	frames := make([]FrameInfo, 0, len(files))
 	for _, file := range files {
 		base := filepath.Base(file)
-		frameNumStr := strings.TrimPrefix(strings.TrimSuffix(base, ".jpg"), "frame_")
+		frameNumStr := strings.TrimPrefix(strings.TrimSuffix(base, ".jpg"), frameStripPrefix)
 		frameNum, err := strconv.ParseInt(frameNumStr, 10, 64)
 		if err != nil {
 			continue
@@ -469,13 +481,205 @@ func getFrameTimes(outDir string, fps float64) ([]FrameInfo, error) {
 	return frames, nil
 }
 
+// computeDHash computes a 64-bit difference hash (dHash) for a JPEG image.
+// It samples a 9×8 grid of grayscale values and sets a bit for each row/column
+// pair where the left pixel is darker than the right neighbour.
+func computeDHash(imgPath string, hashSize int) (*big.Int, error) {
+	if hashSize < 2 {
+		// allow any >=2; upper bound not enforced here
+		return nil, fmt.Errorf("dhash-size must be >= 2")
+	}
+	hashW := hashSize + 1 // columns
+	hashH := hashSize     // rows
+
+	file, err := os.Open(imgPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return nil, err
+	}
+
+	bounds := img.Bounds()
+	w := bounds.Max.X - bounds.Min.X
+	h := bounds.Max.Y - bounds.Min.Y
+
+	// Sample grayscale luminance at the centre of each grid cell.
+	gray := make([][]float64, hashH)
+	for r := 0; r < hashH; r++ {
+		gray[r] = make([]float64, hashW)
+	}
+	for row := 0; row < hashH; row++ {
+		for col := 0; col < hashW; col++ {
+			x := bounds.Min.X + (col*w*2+w)/(hashW*2)
+			y := bounds.Min.Y + (row*h*2+h)/(hashH*2)
+			r, g, b, _ := img.At(x, y).RGBA() // 16-bit components
+			gray[row][col] = 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
+		}
+	}
+
+	// Build hash into a big.Int
+	hash := big.NewInt(0)
+	for row := 0; row < hashH; row++ {
+		for col := 0; col < hashH; col++ {
+			if gray[row][col] < gray[row][col+1] {
+				bitIdx := row*hashH + col
+				hash.SetBit(hash, bitIdx, 1)
+			}
+		}
+	}
+	return hash, nil
+}
+
+// hammingDistance returns the number of differing bits between two 64-bit hashes.
+// hammingDistanceBig counts differing bits between two big.Int hashes.
+func hammingDistanceBig(a, b *big.Int) int {
+	if a == nil || b == nil {
+		return math.MaxInt32
+	}
+	x := new(big.Int).Xor(a, b)
+	words := x.Bits()
+	total := 0
+	for _, w := range words {
+		total += bits.OnesCount64(uint64(w))
+	}
+	return total
+}
+
+// deduplicateFrames removes frames that are visually too similar to recent kept
+// frames. A frame is dropped when its dHash Hamming distance to any of the last
+// compareDistance kept frames is <= maxDistance. Dropped files are deleted from disk.
+func deduplicateFrames(frames []FrameInfo, maxDistance int, compareDistance int, hashSize int) ([]FrameInfo, error) {
+	if len(frames) == 0 {
+		return frames, nil
+	}
+
+	h0, err := computeDHash(frames[0].Path, hashSize)
+	if err != nil {
+		return nil, fmt.Errorf("error hashing %s: %w", frames[0].Path, err)
+	}
+	kept := []FrameInfo{frames[0]}
+	keptHashes := []*big.Int{h0}
+
+	for i := 1; i < len(frames); i++ {
+		h, err := computeDHash(frames[i].Path, hashSize)
+		if err != nil {
+			fmt.Printf("Warning: could not hash %s, keeping it: %v\n", filepath.Base(frames[i].Path), err)
+			kept = append(kept, frames[i])
+			keptHashes = append(keptHashes, nil)
+			continue
+		}
+
+		// Compare with the last compareDistance kept frames.
+		startIdx := len(keptHashes) - compareDistance
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		tooSimilar := false
+		matchedIdx := -1
+		for j, kh := range keptHashes[startIdx:] {
+			if kh == nil {
+				continue
+			}
+			if hammingDistanceBig(h, kh) <= maxDistance {
+				tooSimilar = true
+				matchedIdx = startIdx + j
+				break
+			}
+		}
+
+		if tooSimilar {
+			similarTo := "unknown"
+			if matchedIdx >= 0 && matchedIdx < len(kept) {
+				similarTo = filepath.Base(kept[matchedIdx].Path)
+			}
+			fmt.Printf("Removing similar frame: %s (similar to %s)\n", filepath.Base(frames[i].Path), similarTo)
+			if err := os.Remove(frames[i].Path); err != nil {
+				fmt.Printf("Warning: could not remove %s: %v\n", filepath.Base(frames[i].Path), err)
+			}
+		} else {
+			kept = append(kept, frames[i])
+			keptHashes = append(keptHashes, h)
+		}
+	}
+
+	return kept, nil
+}
+
+// tagJob represents a single tagging task for a worker.
+type tagJob struct {
+	Path   string
+	Lat    float64
+	Lon    float64
+	Height float64
+	Label  string // friendly name for logging
+}
+
+// runTagJobs runs tagging jobs with a fixed number of worker goroutines.
+// It returns the number of successful tags and the number of failures.
+func runTagJobs(jobs []tagJob, workers int) (int, int) {
+	if len(jobs) == 0 {
+		return 0, 0
+	}
+
+	jobCh := make(chan tagJob)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	success := 0
+	failure := 0
+
+	worker := func() {
+		defer wg.Done()
+		for j := range jobCh {
+			err := tagImage(j.Path, j.Lat, j.Lon, j.Height)
+			mu.Lock()
+			if err != nil {
+				failure++
+				fmt.Printf("Error tagging %s: %v\n", filepath.Base(j.Path), err)
+			} else {
+				success++
+				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(j.Path), j.Lat, j.Lon)
+			}
+			mu.Unlock()
+		}
+	}
+
+	// start workers
+	if workers < 1 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	// dispatch jobs
+	go func() {
+		for _, j := range jobs {
+			jobCh <- j
+		}
+		close(jobCh)
+	}()
+
+	wg.Wait()
+	return success, failure
+}
+
 func main() {
 	pflag.StringVarP(&options.inputVideo, "input", "i", "", "Input video file")
+	pflag.StringVarP(&options.outputDir, "output", "o", "", "Output directory for extracted frames (default: <input>_jpegs)")
 	pflag.StringVar(&options.extractMode, "extract", "", "Extraction mode: fps=N, all, or direct")
 	pflag.StringVar(&options.tagMode, "tag", "", "Tagging mode: direct, all, allip, none")
 	pflag.BoolVarP(&options.longHelp, "long-help", "H", false, "Display long help")
 	pflag.BoolVar(&options.useHeight, "use-height", false, "Enable height tagging in images")
 	pflag.Float64Var(&options.heightOffset, "height-offset", 0.0, "Height offset to apply (meters)")
+	pflag.BoolVar(&options.dedup, "dedup", false, "Removes similar images after extraction")
+	pflag.Float64Var(&options.dedupDistance, "dedup-distance", 20, "Hamming distance threshold (0-64) for deduplication; lower = stricter (default 10)")
+	pflag.IntVar(&options.dedupCompareDistance, "dedup-compare-distance", 1, "The distance of images to compare with. Example: if value is 2 then frame 7 will be compared to both 8 and 9")
+	pflag.IntVar(&options.dhashSize, "dhash-size", 8, "dHash resolution (hash size). Allowed 2..8; higher = higher quality but more bits")
 	pflag.Parse()
 
 	inputVideo := options.inputVideo
@@ -511,7 +715,11 @@ func main() {
 
 	base := strings.TrimSuffix(inputVideo, filepath.Ext(inputVideo))
 	srtPath := base + ".srt"
-	outDir := base + "_jpegs"
+	filePrefix := filepath.Base(base)
+	outDir := options.outputDir
+	if outDir == "" {
+		outDir = base + "_jpegs"
+	}
 
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		fmt.Printf("Error creating output directory: %v\n", err)
@@ -546,11 +754,11 @@ func main() {
 			fmt.Printf("Error getting FPS: %v\n", err)
 			os.Exit(1)
 		}
-		if err := extractFrames(inputVideo, outDir, "frame_%08d.jpg", "-vsync", "0", "-start_number", "0", "-q:v", "2"); err != nil {
+		if err := extractFrames(inputVideo, outDir, filePrefix+"_frame_%08d.jpg", "-vsync", "0", "-start_number", "0", "-q:v", "2"); err != nil {
 			fmt.Printf("Error extracting frames: %v\n", err)
 			os.Exit(1)
 		}
-		frames, err = getFrameTimes(outDir, fps)
+		frames, err = getFrameTimes(outDir, filePrefix, fps)
 		if err != nil {
 			fmt.Printf("Error getting frame times: %v\n", err)
 			os.Exit(1)
@@ -564,11 +772,11 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("Extracting at %.2f fps...\n", fps)
-		if err := extractFrames(inputVideo, outDir, "frame_%08d.jpg", "-r", fmt.Sprintf("%.2f", fps), "-start_number", "0", "-q:v", "2"); err != nil {
+		if err := extractFrames(inputVideo, outDir, filePrefix+"_frame_%08d.jpg", "-r", fmt.Sprintf("%.2f", fps), "-start_number", "0", "-q:v", "2"); err != nil {
 			fmt.Printf("Error extracting frames: %v\n", err)
 			os.Exit(1)
 		}
-		frames, err = getFrameTimes(outDir, fps)
+		frames, err = getFrameTimes(outDir, filePrefix, fps)
 		if err != nil {
 			fmt.Printf("Error getting frame times: %v\n", err)
 			os.Exit(1)
@@ -578,7 +786,7 @@ func main() {
 		fmt.Println("Extracting GPS-linked frames...")
 		for _, entry := range entries {
 			timeFF := strings.Replace(entry.TimeStr, ",", ".", -1)
-			frameName := fmt.Sprintf("direct_%s.jpg", strings.ReplaceAll(strings.ReplaceAll(entry.TimeStr, ":", "_"), ",", "_"))
+			frameName := fmt.Sprintf("%s_direct_%s.jpg", filePrefix, strings.ReplaceAll(strings.ReplaceAll(entry.TimeStr, ":", "_"), ",", "_"))
 			outPath := filepath.Join(outDir, frameName)
 
 			cmd := exec.Command(ffmpegBase, append(extraFfmpegArgs, "-y", "-ss", timeFF, "-i", inputVideo,
@@ -600,58 +808,84 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Tagging logic
+	// Record total frames extracted before deduplication
+	extractedCount := len(frames)
+
+	// Deduplication
+	if options.dedup {
+		originalCount := len(frames)
+		fmt.Printf("Deduplicating frames (threshold=%d, compare-distance=%d)...\n",
+			int(options.dedupDistance), options.dedupCompareDistance)
+		frames, err = deduplicateFrames(frames, int(options.dedupDistance), options.dedupCompareDistance, options.dhashSize)
+		if err != nil {
+			fmt.Printf("Error deduplicating frames: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Kept %d/%d frames after deduplication\n", len(frames), originalCount)
+	}
+
+	// frames removed due to dedup
+	removedCount := 0
+	if extractedCount > len(frames) {
+		removedCount = extractedCount - len(frames)
+	}
+
+	// Tagging logic (multi-threaded)
+	var totalTaggedSuccess, totalTaggedFailure int
 	switch tagMode {
 	case "direct":
-		fmt.Println("Tagging direct frames...")
+		fmt.Println("Tagging direct frames (multithreaded)...")
+		jobs := make([]tagJob, 0, len(entries))
 		for _, entry := range entries {
 			closest, err := findClosestFrame(frames, entry.TimeSec)
 			if err != nil {
 				fmt.Printf("Error finding frame for time %.2f: %v\n", entry.TimeSec, err)
 				continue
 			}
-			if err := tagImage(closest.Path, entry.Lat, entry.Lon, entry.Height); err != nil {
-				fmt.Printf("Error tagging %s: %v\n", filepath.Base(closest.Path), err)
-			} else {
-				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(closest.Path), entry.Lat, entry.Lon)
-			}
+			jobs = append(jobs, tagJob{Path: closest.Path, Lat: entry.Lat, Lon: entry.Lon, Height: entry.Height, Label: filepath.Base(closest.Path)})
 		}
+		s, f := runTagJobs(jobs, 6)
+		totalTaggedSuccess += s
+		totalTaggedFailure += f
 
 	case "all":
-		fmt.Println("Tagging all frames with closest GPS...")
+		fmt.Println("Tagging all frames with closest GPS (multithreaded)...")
+		jobs := make([]tagJob, 0, len(frames))
 		for _, frame := range frames {
 			gps, err := findClosestGPS(entries, frame.TimeSec)
 			if err != nil {
 				fmt.Printf("Error finding GPS for frame %s: %v\n", filepath.Base(frame.Path), err)
 				continue
 			}
-			if err := tagImage(frame.Path, gps.Lat, gps.Lon, gps.Height); err != nil {
-				fmt.Printf("Error tagging %s: %v\n", filepath.Base(frame.Path), err)
-			} else {
-				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(frame.Path), gps.Lat, gps.Lon)
-			}
+			jobs = append(jobs, tagJob{Path: frame.Path, Lat: gps.Lat, Lon: gps.Lon, Height: gps.Height, Label: filepath.Base(frame.Path)})
 		}
+		s, f := runTagJobs(jobs, 6)
+		totalTaggedSuccess += s
+		totalTaggedFailure += f
 
 	case "allip":
-		fmt.Println("Tagging all frames with interpolated GPS...")
+		fmt.Println("Tagging all frames with interpolated GPS (multithreaded)...")
+		jobs := make([]tagJob, 0, len(frames))
 		for _, frame := range frames {
 			lat, lon, height, err := interpolateGPS(entries, frame.TimeSec)
 			if err != nil {
 				fmt.Printf("Error interpolating GPS for frame %s: %v\n", filepath.Base(frame.Path), err)
 				continue
 			}
-			if err := tagImage(frame.Path, lat, lon, height); err != nil {
-				fmt.Printf("Error tagging %s: %v\n", filepath.Base(frame.Path), err)
-			} else {
-				fmt.Printf("Tagged %s: lat=%.6f, lon=%.6f\n", filepath.Base(frame.Path), lat, lon)
-			}
+			jobs = append(jobs, tagJob{Path: frame.Path, Lat: lat, Lon: lon, Height: height, Label: filepath.Base(frame.Path)})
 		}
+		s, f := runTagJobs(jobs, 6)
+		totalTaggedSuccess += s
+		totalTaggedFailure += f
 
 	case "none":
 		fmt.Println("Skipping tagging as requested")
 	}
 
 	fmt.Println("Operation completed successfully.")
+
+	// Summary
+	fmt.Printf("Summary: mode=%s, total_extracted=%d, total_removed_by_dedup=%d\n", extractMode, extractedCount, removedCount)
 }
 
 //go:embed longhelp.md
